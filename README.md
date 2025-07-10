@@ -159,9 +159,9 @@ max(2, 3*4, log(e), 6*7, 9/8)
 ## 📊 Network Analysis
 
 ### Wireshark Captures Included:
-- **הקלטה 1.pcapng** - Basic client-server communication
-- **הקלטה 2.pcapng** - Proxy caching behavior analysis  
-- **הקלטה 3.pcapng** - Multi-client concurrent connections
+- **Wireshark_Recording_1.pcapng** - Basic client-server communication
+- **Wireshark_Recording_2.pcapng** - Proxy caching behavior analysis  
+- **Wireshark_Recording_3.pcapng** - Multi-client concurrent connections
 
 ### Analysis Points:
 - TCP handshake establishment
