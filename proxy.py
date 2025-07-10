@@ -1,3 +1,47 @@
+"""
+Assignment 2 - Computer Networks
+Calculator Proxy Server Implementation
+
+Purpose:
+========
+This file implements a caching proxy server that sits between calculator clients
+and the calculator server. The proxy caches calculation results to improve performance
+and reduce server load by serving repeated requests from cache when possible.
+
+Proxy Architecture:
+==================
+- Multi-threaded TCP proxy server
+- Intelligent caching system with configurable cache control
+- Transparent proxy operation (clients connect to proxy as if it were the server)
+- Cache freshness validation based on timestamps and cache control headers
+
+Caching Strategy:
+================
+The proxy implements HTTP-like caching semantics:
+- Requests with cache_control=0 bypass cache (force reload)
+- Cache entries have server-side and client-side expiration times
+- Stale cache entries are refreshed from the server
+- Cache keys are based on expression data and show_steps flag
+
+Cache Management:
+================
+- In-memory cache storage using dictionary
+- Cache entries keyed by (expression_data, show_steps) tuple
+- Cache freshness determined by comparing age with cache_control values
+- Support for indefinite caching when cache_control=MAX_CACHE_CONTROL
+
+Usage Instructions:
+==================
+python proxy.py                           # Start proxy on default ports
+python proxy.py -pp 8888                 # Proxy listens on port 8888
+python proxy.py -sp 9999 -sh 192.168.1.5 # Connect to server on remote host
+
+Proxy Flow:
+==========
+Client -> Proxy -> Server (if cache miss/stale)
+Client <- Proxy <- Cache (if cache hit)
+"""
+
 import api
 import argparse
 import threading
@@ -5,18 +49,46 @@ import socket
 import time
 import math
 
+# Global cache storage: maps (expression_data, show_steps) -> CalculatorHeader response
 cache: dict[tuple[bytes, bool], api.CalculatorHeader] = {}
+
+# Constant for indefinite cache control (maximum possible value)
 INDEFINITE = api.CalculatorHeader.MAX_CACHE_CONTROL
 
 
 def process_request(request: api.CalculatorHeader, server_address: tuple[str, int]) -> tuple[api.CalculatorHeader, int, int, bool, bool, bool]:
-    '''
-    Function which processes the client request if specified we cache the result
-    Returns the response, the time remaining before the server deems the response stale, the time remaining before the client deems the response stale, whether the response returned was from the cache, whether the response was stale, and whether we cached the response
-    If the request.cache_control is 0, we don't use the cache and send a new request to the server. (like a reload)
-    If the request.cache_control < time() - cache[request].unix_time_stamp, the client doesn't allow us to use the cache and we send a new request to the server.
-    If the cache[request].cache_control is 0, the response must not be cached.
-    '''
+    """
+    Processes client request with intelligent caching logic
+    
+    This function implements the core proxy logic, deciding whether to serve
+    from cache or forward the request to the server based on cache control
+    headers and cache freshness.
+    
+    Args:
+        request: Client request header containing expression and cache preferences
+        server_address: Address of the calculator server (host, port)
+        
+    Returns:
+        tuple containing:
+        - response: CalculatorHeader with calculation result
+        - server_time_remaining: Seconds until server considers response stale
+        - client_time_remaining: Seconds until client considers response stale  
+        - cache_hit: Boolean indicating if response came from cache
+        - was_stale: Boolean indicating if cached response was stale
+        - cached: Boolean indicating if response was stored in cache
+        
+    Cache Logic:
+    1. If request.cache_control=0, bypass cache (force reload)
+    2. Check cache for matching entry (expression + show_steps)
+    3. Validate cache freshness against server and client cache control
+    4. If fresh, return cached response
+    5. If stale/missing, forward to server and optionally cache result
+    
+    Raises:
+        TypeError: If request is actually a response
+        api.CalculatorServerError: If server connection fails and no cache available
+        api.CalculatorClientError: If response unpacking fails
+    """
     if not request.is_request:
         raise TypeError("Received a response instead of a request")
 
@@ -74,60 +146,109 @@ def process_request(request: api.CalculatorHeader, server_address: tuple[str, in
     return response, server_time_remaining, client_time_remaining, False, was_stale, cached
 
 
-def proxy(proxy_address: tuple[str, int], server_adress: tuple[str, int]) -> None:
-    # socket(socket.AF_INET, socket.SOCK_STREAM)
-    # (1) AF_INET is the address family for IPv4 (Address Family)
-    # (2) SOCK_STREAM is the socket type for TCP (Socket Type) - [SOCK_DGRAM is the socket type for UDP]
-    # Note: context manager ('with' keyword) closes the socket when the block is exited
+def proxy(proxy_address: tuple[str, int], server_address: tuple[str, int]) -> None:
+    """
+    Main proxy function that sets up proxy server and handles client connections
+    
+    This function creates a TCP proxy server that listens for client connections
+    and forwards requests to the calculator server while managing caching.
+    
+    Args:
+        proxy_address: Address for proxy to bind to (host, port)
+        server_address: Address of the calculator server to forward requests to
+        
+    Proxy Architecture:
+    - Listens for client connections on proxy_address
+    - Each client connection handled by separate thread
+    - Forwards requests to server_address when cache miss occurs
+    - Maintains persistent cache across all client connections
+    
+    Socket Operations:
+    1. Create TCP socket with IPv4
+    2. Set SO_REUSEADDR for immediate restart capability
+    3. Bind to proxy address and listen for connections
+    4. Accept client connections and spawn handler threads
+    5. Graceful shutdown on KeyboardInterrupt
+    """
+    # Create TCP socket using IPv4
+    # AF_INET = Address Family for IPv4, SOCK_STREAM = TCP socket type
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as proxy_socket:
-        # SO_REUSEADDR is a socket option that allows the socket to be bound to an address that is already in use.
+        # Allow immediate reuse of address (prevents "Address already in use" errors)
         proxy_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
-        # Prepare the proxy socket
-        # * Fill in start (1)
+        # Bind proxy socket to specified address and start listening
         proxy_socket.bind(proxy_address)
         proxy_socket.listen()
-        # * Fill in end (1)
 
         threads = []
         print(f"Listening on {proxy_address[0]}:{proxy_address[1]}")
 
         while True:
             try:
-                # Establish connection with client.
-                
-                client_socket, client_address = proxy_socket.accept()# * Fill in start (2) # * Fill in end (2)
+                # Accept incoming client connection
+                client_socket, client_address = proxy_socket.accept()
 
-                # Create a new thread to handle the client request
+                # Create dedicated thread for this client connection
+                # Pass server address so handler knows where to forward requests
                 thread = threading.Thread(target=client_handler, args=(
-                    client_socket, client_address, server_adress))
+                    client_socket, client_address, server_address))
                 thread.start()
                 threads.append(thread)
             except KeyboardInterrupt:
                 print("Shutting down...")
                 break
 
-        for thread in threads:  # Wait for all threads to finish
+        # Wait for all client handler threads to complete
+        for thread in threads:
             thread.join()
 
 
 def client_handler(client_socket: socket.socket, client_address: tuple[str, int], server_address: tuple[str, int]) -> None:
-    '''
-    Function which handles client requests
-    '''
+    """
+    Handles individual client connection with caching proxy logic
+    
+    This function manages communication with a single client, processing requests
+    through the caching layer and forwarding to the server when necessary.
+    
+    Args:
+        client_socket: Socket for communication with the client
+        client_address: Client's IP address and port
+        server_address: Calculator server's address for request forwarding
+        
+    Process Flow:
+    1. Receive client requests
+    2. Process through caching layer (check cache, validate freshness)
+    3. Forward to server if cache miss or stale
+    4. Cache response if appropriate
+    5. Send response back to client
+    6. Log cache statistics (hit/miss/stale)
+    
+    Cache Statistics Logged:
+    - Cache hit: Response served from cache
+    - Cache miss (stale): Cached response was expired
+    - Cache miss (cached): New response was cached
+    - Cache miss (not cached): New response was not cached
+    
+    Error Handling:
+    - Malformed requests: Send CLIENT_ERROR response
+    - Server connection issues: Send SERVER_ERROR response
+    - Proxy internal errors: Send SERVER_ERROR response
+    """
     client_prefix = f"{{{client_address[0]}:{client_address[1]}}}"
-    with client_socket:  # closes the socket when the block is exited
-        print(f"{client_prefix} Connected established")
+    
+    # Use context manager to ensure proper socket cleanup
+    with client_socket:
+        print(f"{client_prefix} Connection established")
+        
         while True:
-            # Receive data from the client
-            
-            data = client_socket.recv(api.BUFFER_SIZE)# * Fill in start (3) # * Fill in end (3)
+            # Receive data from client
+            data = client_socket.recv(api.BUFFER_SIZE)
             if not data:
-                # * Change in start (1)
+                # Client disconnected (empty data indicates connection closed)
                 break
-                # * Change in end (1)
+                
             try:
-                # Process the request
+                # Unpack client request
                 try:
                     request = api.CalculatorHeader.unpack(data)
                 except Exception as e:
@@ -136,9 +257,11 @@ def client_handler(client_socket: socket.socket, client_address: tuple[str, int]
 
                 print(f"{client_prefix} Got request of length {len(data)} bytes")
 
+                # Process request through caching layer
                 response, server_time_remaining, client_time_remaining, cache_hit, was_stale, cached = process_request(
                     request, server_address)
 
+                # Log cache statistics for monitoring
                 if cache_hit:
                     print(f"{client_prefix} Cache hit", end=" ,")
                 elif was_stale:
@@ -146,48 +269,52 @@ def client_handler(client_socket: socket.socket, client_address: tuple[str, int]
                 elif cached:
                     print(f"{client_prefix} Cache miss, response cached", end=" ,")
                 else:
-                    print(
-                        f"{client_prefix} Cache miss, response not cached", end=" ,")
-                print(
-                    f"server time remaining: {server_time_remaining:.2f}, client time remaining: {client_time_remaining:.2f}")
+                    print(f"{client_prefix} Cache miss, response not cached", end=" ,")
+                print(f"server time remaining: {server_time_remaining:.2f}, client time remaining: {client_time_remaining:.2f}")
 
+                # Pack and send response back to client
                 response = response.pack()
-                print(
-                    f"{client_prefix} Sending response of length {len(response)} bytes")
-
-                # Send the response back to the client
-                # * Fill in start (4)
+                print(f"{client_prefix} Sending response of length {len(response)} bytes")
                 client_socket.sendall(response)
-                # * Fill in end (4)
                 
             except Exception as e:
+                # Handle proxy internal errors
                 print(f"Unexpected server error: {e}")
-                client_socket.sendall(api.CalculatorHeader.from_error(api.CalculatorServerError(
-                    "Internal proxy error", e), api.CalculatorHeader.STATUS_SERVER_ERROR, False, 0).pack())
+                error_response = api.CalculatorHeader.from_error(
+                    api.CalculatorServerError("Internal proxy error", e), 
+                    api.CalculatorHeader.STATUS_SERVER_ERROR, False, 0)
+                client_socket.sendall(error_response.pack())
 
-        # * Change in start (2)
         print(f"{client_prefix} Connection closed")
         client_socket.close()
-        # * Change in end (2)
 
 if __name__ == '__main__':
-    arg_parser = argparse.ArgumentParser(
-        description='A Calculator Server.')
+    # Parse command line arguments for proxy configuration
+    arg_parser = argparse.ArgumentParser(description='A Calculator Proxy Server.')
 
+    # Proxy server configuration
     arg_parser.add_argument('-pp', '--proxy_port', type=int, dest='proxy_port',
-                            default=api.DEFAULT_PROXY_PORT, help='The port that the proxy listens on.')
+                            default=api.DEFAULT_PROXY_PORT, 
+                            help='The port that the proxy listens on.')
     arg_parser.add_argument('-ph', '--proxy_host', type=str, dest='proxy_host',
-                            default=api.DEFAULT_PROXY_HOST, help='The host that the proxy listens on.')
+                            default=api.DEFAULT_PROXY_HOST, 
+                            help='The host that the proxy listens on.')
+    
+    # Target server configuration  
     arg_parser.add_argument('-sp', '--server_port', type=int, dest='server_port',
-                            default=api.DEFAULT_SERVER_PORT, help='The port that the server listens on.')
+                            default=api.DEFAULT_SERVER_PORT, 
+                            help='The port that the server listens on.')
     arg_parser.add_argument('-sh', '--server_host', type=str, dest='server_host',
-                            default=api.DEFAULT_SERVER_HOST, help='The host that the server listens on.')
+                            default=api.DEFAULT_SERVER_HOST, 
+                            help='The host that the server listens on.')
 
     args = arg_parser.parse_args()
 
+    # Extract configuration values
     proxy_host = args.proxy_host
     proxy_port = args.proxy_port
     server_host = args.server_host
     server_port = args.server_port
 
+    # Start proxy server
     proxy((proxy_host, proxy_port), (server_host, server_port))

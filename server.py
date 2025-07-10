@@ -1,20 +1,90 @@
+"""
+Assignment 2 - Computer Networks
+Calculator Server Implementation
+
+Purpose:
+========
+This file implements a multi-threaded TCP server that receives mathematical expressions
+from clients, performs complex calculations, and returns results with optional step-by-step
+solutions. The server handles multiple concurrent client connections using threading.
+
+Server Architecture:
+===================
+- Multi-threaded TCP server using socket programming
+- Each client connection is handled by a separate thread
+- Supports caching policies for optimized performance
+- Implements custom protocol for communication with clients
+
+Protocol Handling:
+=================
+The server receives requests using the protocol defined in api.py:
+- Unpacks incoming binary data into CalculatorHeader objects
+- Processes mathematical expressions recursively
+- Returns results with optional calculation steps
+- Handles errors gracefully with appropriate status codes
+
+Key Features:
+============
+1. Multi-threaded architecture for concurrent client handling
+2. Recursive expression evaluation with step tracking
+3. Support for various mathematical operations (arithmetic, trigonometric, logarithmic)
+4. Error handling and appropriate status code responses
+5. Configurable caching policies
+
+Mathematical Operations Supported:
+================================
+- Basic arithmetic: +, -, *, /, %, **
+- Trigonometric functions: sin, cos, tan
+- Mathematical functions: sqrt, log, max, min, pow
+- Constants: pi, tau, e
+- Unary operations: negation, positive
+
+Usage Instructions:
+==================
+python server.py                    # Start server on default port (9999)
+python server.py -p 8888           # Start server on port 8888
+python server.py -H 0.0.0.0        # Start server on all network interfaces
+"""
+
 import numbers
 import api
 import argparse
 import socket
 import threading
 
-CACHE_POLICY = True  # whether to cache responses or not
-# the maximum time that the response can be cached for (in seconds)
-CACHE_CONTROL = 2 ** 16 - 1
+# Server configuration constants
+CACHE_POLICY = True  # Whether to cache responses or not
+CACHE_CONTROL = 2 ** 16 - 1  # Maximum time that response can be cached (in seconds)
 
 
 def calculate(expression: api.Expr, steps: list[str] = []) -> tuple[numbers.Real, list[api.Expression]]:
-    '''    
-    Function which calculates the result of an expression and returns the result and the steps taken to calculate it.
-    The function recursively descends into the expression tree and calculates the result of the expression.
-    Each expression wraps the result of its subexpressions in parentheses and adds the result to the steps list.
-    '''
+    """
+    Recursively calculates the result of a mathematical expression and tracks calculation steps
+    
+    This function implements a recursive descent calculator that processes different types
+    of mathematical expressions and builds a step-by-step solution path.
+    
+    Args:
+        expression: The mathematical expression to evaluate (from api.py types)
+        steps: List to accumulate calculation steps (modified in-place)
+        
+    Returns:
+        tuple: (final_result, list_of_expression_steps)
+        
+    Raises:
+        TypeError: If an unknown expression type is encountered
+        
+    Expression Types Handled:
+    - Constant/NamedConstant: Direct value return
+    - BinaryExpr: Two-operand operations (+, -, *, /, %, **)
+    - UnaryExpr: Single-operand operations (-, +)
+    - FunctionCallExpr: Function calls (sin, cos, max, etc.)
+    
+    The function builds a complete step-by-step solution by:
+    1. Recursively evaluating sub-expressions
+    2. Recording intermediate results
+    3. Combining results according to operator precedence
+    """
     expr = api.type_fallback(expression)
     const = None
     if isinstance(expr, api.Constant) or isinstance(expr, api.NamedConstant):
@@ -57,78 +127,156 @@ def calculate(expression: api.Expr, steps: list[str] = []) -> tuple[numbers.Real
 
 
 def process_request(request: api.CalculatorHeader) -> api.CalculatorHeader:
-    '''
-    Function which processes a CalculatorRequest and builds a CalculatorResponse.
-    '''
+    """
+    Processes a client request and builds an appropriate response
+    
+    This function takes a CalculatorHeader request, extracts the mathematical expression,
+    performs the calculation, and builds a response with the result and optional steps.
+    
+    Args:
+        request: CalculatorHeader object containing the client request
+        
+    Returns:
+        CalculatorHeader: Response object with calculation result or error information
+        
+    Process:
+    1. Validates that the received packet is actually a request
+    2. Extracts the mathematical expression from request data
+    3. Calls calculate() to perform the computation
+    4. Formats the response with results and optional calculation steps
+    5. Handles errors by returning appropriate error responses
+    
+    Error Handling:
+    - Client errors (400): Invalid expression format, malformed request
+    - Server errors (500): Unexpected calculation errors, system issues
+    """
     result, steps = None, []
     try:
         if request.is_request:
+            # Extract mathematical expression from request data
             expr = api.data_to_expression(request)
+            # Perform the calculation and get steps
             result, steps = calculate(expr, steps)
         else:
             raise TypeError("Received a response instead of a request")
     except Exception as e:
+        # Return error response for any calculation or parsing errors
         return api.CalculatorHeader.from_error(e, api.CalculatorHeader.STATUS_CLIENT_ERROR, CACHE_POLICY, CACHE_CONTROL)
 
+    # Format calculation steps if requested by client
     if request.show_steps:
         steps = [api.stringify(step, add_brackets=True) for step in steps]
     else:
         steps = []
 
+    # Return successful response with result and optional steps
     return api.CalculatorHeader.from_result(result, steps, CACHE_POLICY, CACHE_CONTROL)
 
 
 def server(host: str, port: int) -> None:
-    # socket(socket.AF_INET, socket.SOCK_STREAM)
-    # (1) AF_INET is the address family for IPv4 (Address Family)
-    # (2) SOCK_STREAM is the socket type for TCP (Socket Type) - [SOCK_DGRAM is the socket type for UDP]
-    # Note: context manager ('with' keyword) closes the socket when the block is exited
+    """
+    Main server function that sets up TCP socket and handles client connections
+    
+    This function creates a TCP server socket, binds it to the specified address,
+    and enters a loop to accept and handle client connections using threading.
+    
+    Args:
+        host: IP address to bind the server to (e.g., "127.0.0.1" or "0.0.0.0")
+        port: Port number to listen on (e.g., 9999)
+        
+    Server Architecture:
+    - Uses IPv4 TCP sockets (AF_INET, SOCK_STREAM)
+    - SO_REUSEADDR option allows immediate restart after shutdown
+    - Multi-threaded: each client connection handled by separate thread
+    - Graceful shutdown on KeyboardInterrupt (Ctrl+C)
+    
+    Socket Operations:
+    1. Create socket with IPv4 and TCP
+    2. Set SO_REUSEADDR to reuse address immediately
+    3. Bind socket to host:port
+    4. Listen for incoming connections
+    5. Accept connections and spawn handler threads
+    """
+    # Create TCP socket using IPv4
+    # AF_INET = Address Family for IPv4
+    # SOCK_STREAM = Socket Type for TCP (SOCK_DGRAM would be UDP)
+    # Context manager ensures socket is properly closed
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_socket:
-        # SO_REUSEADDR is a socket option that allows the socket to be bound to an address that is already in use.
+        # SO_REUSEADDR allows socket to bind to address that was recently used
+        # This prevents "Address already in use" errors during development
         server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
-        # Prepare the server socket
-        # * Fill in start (1)
-        server_socket.bind((host, port))
-        server_socket.listen(1)
-        # * Fill in end (1)
+        # Bind socket to specified address and start listening
+        server_socket.bind((host, port))           # Bind to host:port
+        server_socket.listen(1)                    # Listen for connections (backlog=1)
 
         threads = []
         print(f"Listening on {host}:{port}")
 
         while True:
             try:
-                # Establish connection with client.
-                client_socket, address = server_socket.accept()  # * Fill in start (2) # * Fill in end (2)
+                # Accept incoming client connection
+                # Returns new socket for this client and client's address
+                client_socket, address = server_socket.accept()
 
-                # Create a new thread to handle the client request
-                thread = threading.Thread(target=client_handler, args=(
-                    client_socket, address))
+                # Create new thread to handle this client
+                # Each client gets dedicated thread for concurrent processing
+                thread = threading.Thread(target=client_handler, args=(client_socket, address))
                 thread.start()
                 threads.append(thread)
             except KeyboardInterrupt:
                 print("Shutting down...")
                 break
 
-        for thread in threads:  # Wait for all threads to finish
+        # Wait for all client handler threads to complete before exit
+        for thread in threads:
             thread.join()
 
 
 def client_handler(client_socket: socket.socket, client_address: tuple[str, int]) -> None:
-    '''
-    Function which handles client requests
-    '''
+    """
+    Handles individual client connection in a dedicated thread
+    
+    This function manages the communication with a single client, processing
+    multiple requests over the same connection until the client disconnects.
+    
+    Args:
+        client_socket: Socket object for communication with this specific client
+        client_address: Tuple containing client's IP address and port number
+        
+    Process:
+    1. Accept and maintain connection with client
+    2. Receive data packets from client
+    3. Unpack and validate requests
+    4. Process mathematical expressions
+    5. Send responses back to client
+    6. Handle connection termination gracefully
+    
+    Error Handling:
+    - Malformed packets: Send CLIENT_ERROR response
+    - Calculation errors: Send CLIENT_ERROR response  
+    - Server errors: Send SERVER_ERROR response
+    - Connection issues: Log and terminate connection
+    
+    The function operates in a loop, processing multiple requests from the same
+    client until the connection is closed or an error occurs.
+    """
     client_addr = f"{client_address[0]}:{client_address[1]}"
     client_prefix = f"{{{client_addr}}}"
-    with client_socket:  # closes the socket when the block is exited
-        print(f"Conection established with {client_addr}")
+    
+    # Use context manager to ensure socket is properly closed
+    with client_socket:
+        print(f"Connection established with {client_addr}")
+        
         while True:
+            # Receive data from client (blocking call)
             data = client_socket.recv(api.BUFFER_SIZE)
             if not data:
-            # * Change in start (1)
+                # Client closed connection (empty data indicates disconnection)
                 break
-            # * Change in end (1)
+                
             try:
+                # Unpack binary data into CalculatorHeader object
                 try:
                     request = api.CalculatorHeader.unpack(data)
                 except Exception as e:
@@ -137,38 +285,40 @@ def client_handler(client_socket: socket.socket, client_address: tuple[str, int]
 
                 print(f"{client_prefix} Got request of length {len(data)} bytes")
 
+                # Process the mathematical expression and generate response
                 response = process_request(request)
 
+                # Pack response into binary format and send to client
                 response = response.pack()
-                print(
-                    f"{client_prefix} Sending response of length {len(response)} bytes")
-                # * Fill in start (4)
+                print(f"{client_prefix} Sending response of length {len(response)} bytes")
                 client_socket.sendall(response)
-                # * Fill in end (4)
 
             except Exception as e:
+                # Handle unexpected server errors
                 print(f"Unexpected server error: {e}")
-                client_socket.sendall(api.CalculatorHeader.from_error(
-                    e, api.CalculatorHeader.STATUS_SERVER_ERROR, CACHE_POLICY, CACHE_CONTROL).pack())
+                error_response = api.CalculatorHeader.from_error(
+                    e, api.CalculatorHeader.STATUS_SERVER_ERROR, CACHE_POLICY, CACHE_CONTROL)
+                client_socket.sendall(error_response.pack())
 
-        # * Change in start (2)
         print(f"{client_prefix} Connection closed")
         client_socket.close()
-        # * Change in end (2)
 
 
 if __name__ == '__main__':
-    arg_parser = argparse.ArgumentParser(
-        description='A Calculator Server.')
+    # Parse command line arguments for server configuration
+    arg_parser = argparse.ArgumentParser(description='A Calculator Server.')
 
     arg_parser.add_argument('-p', '--port', type=int,
-                            default=api.DEFAULT_SERVER_PORT, help='The port to listen on.')
+                            default=api.DEFAULT_SERVER_PORT, 
+                            help='The port to listen on.')
     arg_parser.add_argument('-H', '--host', type=str,
-                            default=api.DEFAULT_SERVER_HOST, help='The host to listen on.')
+                            default=api.DEFAULT_SERVER_HOST, 
+                            help='The host to listen on.')
 
     args = arg_parser.parse_args()
 
     host = args.host
     port = args.port
 
+    # Start the server with specified host and port
     server(host, port)
